@@ -1,0 +1,8 @@
+(* MLB for the sml-kalman library: the vendored sml-matrix dense linear algebra
+ * plus the Kalman/RLS sources.  The dependency .mlb is brought in WITHOUT a
+ * `local` wrapper so consumers (tests, examples) can name `Matrix` alongside
+ * `Kalman`. *)
+$(SML_LIB)/basis/basis.mlb
+../sml-matrix/sml-matrix.mlb
+kalman.sig
+kalman.sml
