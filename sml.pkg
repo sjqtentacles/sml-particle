@@ -1,4 +1,6 @@
 package github.com/sjqtentacles/sml-particle
 
 require {
+  github.com/sjqtentacles/sml-kalman
+  github.com/sjqtentacles/sml-prng
 }
