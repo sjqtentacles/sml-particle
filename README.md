@@ -2,55 +2,76 @@
 
 [![CI](https://github.com/sjqtentacles/sml-particle/actions/workflows/ci.yml/badge.svg)](https://github.com/sjqtentacles/sml-particle/actions/workflows/ci.yml)
 
-Sequential Importance Resampling (SIR) particle filter for Standard ML, with
-a Kalman filter comparison via **sml-kalman**. Models 1D position tracking with
-Gaussian process and observation noise.
+Sequential Importance Resampling (SIR) particle filter for Standard ML, with a
+Kalman filter comparison via **sml-kalman**. Models 1-D position tracking with
+Gaussian process and observation noise, exposes a configurable `params` record,
+weighted statistics, effective sample size, and a per-step trace.
 
 ## Algorithm (SIR)
 
-Each call to `runSIR obs x0 seed` runs a particle filter with N=200 particles:
+For each observation the filter:
 
-1. **Initialise**: all particles at `x0`.
-2. **Predict**: perturb each particle by N(0, q) process noise (Box-Muller via
-   sml-prng SplitMix64).
-3. **Update**: weight each particle by the observation likelihood exp(−(z−x)²/2r²).
-4. **Resample**: systematic resampling from the normalised weight distribution.
-5. Return the posterior mean after processing all observations.
+1. **Predicts** — perturbs each particle by `N(0, q)` process noise (Box-Muller
+   over `sml-prng` SplitMix64, threaded purely for reproducibility).
+2. **Updates** — weights each particle by the Gaussian observation likelihood
+   `exp(-(z-x)^2 / 2r)`, normalized for numerical stability.
+3. **Summarizes** — records the weighted mean and effective sample size.
+4. **Resamples** — systematic resampling from the normalized weights.
 
-Parameters: q = 0.01 (process noise variance), r = 0.1 (observation noise std).
-
-## API sketch
+## API
 
 ```sml
-(* SIR particle filter: track position through 5 observations near 1.0 *)
-val obs = [1.0, 1.0, 1.0, 1.0, 1.0]
-val estimate : real = Particle.runSIR obs 0.0 0wx1234
-(* ≈ 1.0 — converges to true position *)
+type params = { n : int, q : real, r : real, initVar : real }
+val defaultParams : params      (* n=200, q=0.01, r=0.1, initVar=1.0 *)
 
-(* Kalman filter on the same system (exact solution) *)
-val kalman : real = Particle.runKalman obs 0.0
-(* ≈ 1.0 — reference solution *)
+type step = { particles : real list, weights : real list, mean : real, ess : real }
 
-(* Single-step filter *)
-val x1 : real = Particle.filterStep 1.0 0.0
-(* starts shifting estimate toward 1.0 *)
+(* weighted statistics *)
+val weightedMean        : real list -> real list -> real
+val weightedVariance    : real list -> real list -> real
+val effectiveSampleSize : real list -> real
 
-(* Compare both filters on a 5-step observation sequence *)
-val (kEst, pEst) : real * real = Particle.compareKalman ()
+(* filters *)
+val runSIRWith  : params -> real list -> real -> Word64.word -> real
+val runSIR      : real list -> real -> Word64.word -> real
+val runSIRTrace : params -> real list -> real -> Word64.word -> step list
+val runKalman   : real list -> real -> real
+
+(* legacy *)
+val filterStep    : real -> real -> real
+val compareKalman : unit -> real * real
 ```
 
-## Known limitations
+## Examples
 
-- **1D only**: the implementation tracks a scalar state. Multi-dimensional
-  state spaces require generalising the prediction/update steps.
-- **Fixed noise parameters**: q and r are compile-time constants; the API
-  does not accept runtime noise parameters.
-- **N=200 particles**: sufficient for 1D tracking; for high-dimensional or
-  multimodal posteriors, N should be much larger.
-- **Systematic resampling**: avoids weight impoverishment better than
-  multinomial but is still subject to sample degeneracy over many steps.
-- **Seeded, reproducible**: `runSIR` uses a caller-supplied seed for
-  deterministic results in tests.
+```sml
+val obs = [1.0, 1.0, 1.0, 1.0, 1.0]
+
+(* default 200-particle filter, seeded for reproducibility *)
+val est = Particle.runSIR obs 0.0 0wx1234           (* ~= 1.0 *)
+
+(* tune the filter *)
+val p   = { n = 500, q = 0.01, r = 0.1, initVar = 1.0 }
+val est2 = Particle.runSIRWith p obs 0.0 0wx7
+
+(* inspect convergence + degeneracy step by step *)
+val trace = Particle.runSIRTrace p obs 0.0 0wx7
+val esss  = List.map #ess trace                     (* ESS per step *)
+
+(* Kalman reference solution on the same system *)
+val k = Particle.runKalman obs 0.0                  (* ~= 1.0 *)
+```
+
+## Notes and limitations
+
+- **1-D state.** The tracker is scalar; multi-dimensional state requires
+  generalising predict/update (and the Kalman comparison uses 1x1 matrices).
+- **Reproducible.** All randomness threads a caller-supplied `Word64.word` seed,
+  so the same seed gives byte-identical results across MLton and Poly/ML.
+- **Systematic resampling** mitigates weight degeneracy but does not eliminate
+  sample impoverishment over very long sequences.
+- ESS is reported from the **pre-resample** normalized weights; after
+  resampling weights are uniform by construction.
 
 ## Installing with smlpkg
 
@@ -81,10 +102,10 @@ sml.pkg
 Makefile
 lib/github.com/sjqtentacles/sml-particle/
   particle.sig     PARTICLE signature
-  particle.sml     SIR filter + Kalman comparison
+  particle.sml     SIR filter (params/trace/ESS) + Kalman comparison
   particle.mlb
 test/
-  test.sml         convergence-to-true-state tests (Kalman ±0.1, SIR ±0.3)
+  test.sml         weighted stats, ESS bounds, determinism, convergence, configurable N
 ```
 
 ## License

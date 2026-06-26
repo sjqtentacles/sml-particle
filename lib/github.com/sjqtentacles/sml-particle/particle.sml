@@ -1,17 +1,19 @@
 (* SIR particle filter + Kalman comparison for 1-D random-walk tracking.
 
-   Model:   x_{t+1} = x_t + w,   w ~ N(0, Q)   (process)
-            z_t     = x_t + v,   v ~ N(0, R)   (measurement)
+   Model:   x_{t+1} = x_t + w,   w ~ N(0, q)   (process)
+            z_t     = x_t + v,   v ~ N(0, r)   (measurement)
 
-   Q = 0.01, R = 0.1, x_0 = 0.0.
-   `compareKalman` runs both filters on observations [1.0,1.0,1.0,1.0,1.0]
-   and returns (kalman_estimate, particle_estimate). *)
+   Particles are stored in an array and updated in place; the PRNG state is
+   threaded purely so runs are byte-reproducible from a seed. *)
 
 structure Particle :> PARTICLE =
 struct
-  val nParticles = 200
-  val q = 0.01   (* process noise variance *)
-  val r = 0.1    (* observation noise variance *)
+  type params = { n : int, q : real, r : real, initVar : real }
+
+  val defaultParams = { n = 200, q = 0.01, r = 0.1, initVar = 1.0 }
+
+  type step =
+    { particles : real list, weights : real list, mean : real, ess : real }
 
   (* Box-Muller: one standard Gaussian from two U[0,1) samples *)
   fun gauss1 rng =
@@ -21,9 +23,28 @@ struct
       val mag = Math.sqrt (~2.0 * Math.ln (Real.max (u1, 1E~300)))
     in (mag * Math.cos (2.0 * Math.pi * u2), rng2) end
 
-  (* SIR step: predict + weight + resample.
-     Mutates `parts` in-place; returns updated rng. *)
-  fun sirOneStep parts z rng =
+  (* ---- weighted statistics ---- *)
+
+  fun weightedMean values weights =
+    let
+      val tot = List.foldl op+ 0.0 weights
+      val s = ListPair.foldl (fn (v, w, acc) => acc + v * w) 0.0 (values, weights)
+    in if Real.== (tot, 0.0) then 0.0 else s / tot end
+
+  fun weightedVariance values weights =
+    let
+      val m = weightedMean values weights
+      val tot = List.foldl op+ 0.0 weights
+      val s = ListPair.foldl (fn (v, w, acc) => acc + w * (v - m) * (v - m)) 0.0 (values, weights)
+    in if Real.== (tot, 0.0) then 0.0 else s / tot end
+
+  (* ESS = 1 / sum(w_i^2) for normalized weights. *)
+  fun effectiveSampleSize weights =
+    let val s2 = List.foldl (fn (w, acc) => acc + w * w) 0.0 weights
+    in if Real.== (s2, 0.0) then 0.0 else 1.0 / s2 end
+
+  (* ---- one SIR step over an array; returns (step-record, next rng) ---- *)
+  fun sirOneStep (q, r) parts z rng =
     let
       val n = Array.length parts
 
@@ -34,15 +55,19 @@ struct
           in Array.update (parts, i, x + g * Math.sqrt q); rng' end)
           rng parts
 
-      (* Log-weights: log N(z | x_i, R) = -0.5*(z-x)^2/R + const *)
+      (* Log-weights then normalize *)
       val logW = Array.tabulate (n, fn i =>
         ~0.5 * (z - Array.sub (parts, i)) * (z - Array.sub (parts, i)) / r)
-
-      (* Shift by max for numerical stability, then exponentiate *)
       val maxLW = Array.foldl Real.max (Array.sub (logW, 0)) logW
       val w = Array.tabulate (n, fn i => Math.exp (Array.sub (logW, i) - maxLW))
       val tot = Array.foldl op+ 0.0 w
       val () = Array.modify (fn wi => wi / tot) w
+
+      (* summaries computed from PRE-resample particles + weights *)
+      val partsList = List.tabulate (n, fn i => Array.sub (parts, i))
+      val wList = List.tabulate (n, fn i => Array.sub (w, i))
+      val mean = weightedMean partsList wList
+      val ess = effectiveSampleSize wList
 
       (* Cumulative weights for systematic resampling *)
       val cumW = Array.array (n, 0.0)
@@ -51,7 +76,6 @@ struct
         Array.update (cumW, i, Array.sub (cumW, i - 1) + Array.sub (w, i)))
         (List.tabulate (n - 1, fn k => k + 1))
 
-      (* Systematic resampling *)
       val (u0, rng') = Prng.SplitMix64.real01 rng
       val offset = u0 / real n
       val old = Array.tabulate (n, fn i => Array.sub (parts, i))
@@ -65,23 +89,41 @@ struct
               val k' = findK k thresh
           in Array.update (parts, i, Array.sub (old, k')); resample (i + 1) k' end
       val () = resample 0 0
-    in rng' end
+      val resampled = List.tabulate (n, fn i => Array.sub (parts, i))
+    in
+      ({ particles = resampled, weights = wList, mean = mean, ess = ess }, rng')
+    end
 
-  (* Run SIR for a sequence of observations; returns final mean *)
-  fun runSIR obs x0 seed =
+  (* ---- runners ---- *)
+
+  fun initParticles (n, x0, initVar) seed =
     let
-      val n = nParticles
       val rng = ref (Prng.SplitMix64.seed seed)
-      (* Initialise particles as N(x0, 1.0) *)
+      val sd = Math.sqrt initVar
       val parts = Array.tabulate (n, fn _ =>
         let val (g, rng') = gauss1 (!rng)
-        in rng := rng'; x0 + g end)
-      val () = List.app (fn z => rng := sirOneStep parts z (!rng)) obs
-    in Array.foldl op+ 0.0 parts / real n end
+        in rng := rng'; x0 + g * sd end)
+    in (parts, !rng) end
 
-  (* Run Kalman filter for a sequence of observations; returns final x estimate *)
+  fun runSIRTrace ({ n, q, r, initVar } : params) obs x0 seed =
+    let
+      val (parts, rng0) = initParticles (n, x0, initVar) seed
+      fun go ([], _, acc) = List.rev acc
+        | go (z :: zs, rng, acc) =
+            let val (st, rng') = sirOneStep (q, r) parts z rng
+            in go (zs, rng', st :: acc) end
+    in go (obs, rng0, []) end
+
+  fun runSIRWith params obs x0 seed =
+    case List.rev (runSIRTrace params obs x0 seed) of
+        [] => x0
+      | last :: _ => #mean last
+
+  fun runSIR obs x0 seed = runSIRWith defaultParams obs x0 seed
+
   fun runKalman obs x0 =
     let
+      val { q, r, ... } = defaultParams
       val f = Matrix.fromRows [[1.0]]
       val b = Matrix.fromRows [[0.0]]
       val qm = Matrix.fromRows [[q]]
@@ -96,13 +138,8 @@ struct
                   st0 obs
     in Matrix.sub (#x stN, 0, 0) end
 
-  (* filterStep z x: one-shot SIR step: N particles initialised near x,
-     observe z, return weighted mean. *)
-  fun filterStep z x =
-    runSIR [z] x 0wx42
+  fun filterStep z x = runSIR [z] x 0wx42
 
-  (* compareKalman: run both filters on obs=[1,1,1,1,1] from x0=0.
-     True state is 1.0; both estimators should converge near 1.0. *)
   fun compareKalman () =
     let
       val obs = [1.0, 1.0, 1.0, 1.0, 1.0]
