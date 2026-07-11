@@ -62,6 +62,34 @@ val esss  = List.map #ess trace                     (* ESS per step *)
 val k = Particle.runKalman obs 0.0                  (* ~= 1.0 *)
 ```
 
+## Example
+
+`make example` builds and runs [`examples/demo.sml`](examples/demo.sml), which
+compares the SIR particle filter against the Kalman filter on a fixed
+observation sequence, runs the weighted-statistics helpers on a literal batch,
+and prints a short convergence trace for a 50-particle filter tracking a step
+from 0.0 to 2.0 (output is byte-identical under MLton and Poly/ML):
+
+```
+sml-particle demo
+==================
+
+kalman estimate       = 0.9867
+particle estimate     = 0.9954
+
+weighted mean         = 3.0000
+weighted variance     = 1.0000
+effective sample size = 3.3333
+
+SIR trace (n=50, converging toward 2.0):
+  step 0: mean = 1.7279, ess = 5.1935
+  step 1: mean = 1.8162, ess = 41.9239
+  step 2: mean = 1.8873, ess = 45.6004
+  step 3: mean = 1.9152, ess = 47.3447
+  step 4: mean = 1.9335, ess = 47.4389
+  step 5: mean = 1.9463, ess = 48.4421
+```
+
 ## Notes and limitations
 
 - **1-D state.** The tracker is scalar; multi-dimensional state requires
